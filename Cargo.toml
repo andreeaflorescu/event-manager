@@ -1,8 +1,12 @@
 [package]
-name = "crate-template"
+name = "vmm-epoll"
 version = "0.1.0"
-authors = [TODO]
+authors = ["Firecracker Team <firecracker-maintainers@amazon.com>"]
 license = "Apache-2.0 OR BSD-3-Clause"
 edition = "2018"
 
 [dependencies]
+vmm-sys-util = ">=0.2.1"
+libc = ">=0.2.39"
+bitflags = "1.2.0"
+
