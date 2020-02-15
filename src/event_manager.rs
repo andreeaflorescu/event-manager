@@ -2,17 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
-use std::fmt::Formatter;
+use std::convert::Into;
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::{Arc, Mutex};
 
-use crate::epoll::{self, Epoll, EpollEvent};
+use crate::epoll::{self, Epoll, EpollEvent, EventSet};
 
 pub type Result<T> = std::result::Result<T, Error>;
 pub type Pollable = RawFd;
 
 /// Errors associated with epoll events handling.
+#[derive(Debug)]
 pub enum Error {
     /// Cannot create epoll fd.
     EpollCreate(io::Error),
@@ -24,30 +25,9 @@ pub enum Error {
     NotFound(Pollable),
 }
 
-impl std::fmt::Debug for Error {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        use self::Error::*;
-
-        match self {
-            EpollCreate(err) => write!(f, "Unable to create epoll fd: {}", err),
-            Poll(err) => write!(f, "Error during epoll call: {}", err),
-            AlreadyExists(pollable) => write!(
-                f,
-                "A handler for the specified pollable {} already exists.",
-                pollable
-            ),
-            NotFound(pollable) => write!(
-                f,
-                "A handler for the specified pollable {} was not found.",
-                pollable
-            ),
-        }
-    }
-}
-
 /// A trait to express the ability to respond to I/O event readiness
 /// using callbacks.
-pub trait Subscriber {
+pub trait EventSubscriber {
     /// Callback called when an event is available.
     ///
     /// # Arguments
@@ -57,22 +37,72 @@ pub trait Subscriber {
     ///                   The only functions safe to call on this `EventManager` reference
     ///                   are `register`, `unregister` and `modify` which correspond to
     ///                   the `libc::epoll_ctl` operations.
-    fn process(&mut self, event: EpollEvent, event_manager: &mut EventManager);
+    fn process(&mut self, event: EventRegistrationData, event_manager: &mut EventManager);
 
     /// Returns a list of `EpollEvent` that this subscriber is interested in.
-    fn interest_list(&self) -> Vec<EpollEvent>;
+    fn interest_list(&self) -> Vec<EventRegistrationData>;
 }
 
 /// Manages I/O notifications using epoll mechanism.
 pub struct EventManager {
     epoll: Epoll,
-    subscribers: HashMap<RawFd, Arc<Mutex<dyn Subscriber>>>,
+    subscribers: HashMap<RawFd, Arc<Mutex<dyn EventSubscriber>>>,
     ready_events: Vec<EpollEvent>,
 }
 
 impl AsRawFd for EventManager {
     fn as_raw_fd(&self) -> RawFd {
         self.epoll.as_raw_fd()
+    }
+}
+
+/// Safe wrapper over `EpollEvent`.
+pub struct EventRegistrationData {
+    pollable: RawFd,
+    user_data: u32,
+    monitored_events: EventSet,
+}
+
+impl EventRegistrationData {
+    pub fn new<T: AsRawFd>(pollable: &T, monitored_events: EventSet) -> EventRegistrationData {
+        EventRegistrationData {
+            pollable: pollable.as_raw_fd(),
+            user_data: 0,
+            monitored_events,
+        }
+    }
+
+    pub fn set_user_data(&mut self, data: u32) {
+        self.user_data = data;
+    }
+
+    pub fn user_data(&self) -> u32 {
+        self.user_data
+    }
+
+    pub fn fd(&self) -> RawFd {
+        self.pollable
+    }
+
+    pub fn event_set(&self) -> EventSet {
+        self.monitored_events
+    }
+}
+
+impl Into<EpollEvent> for EventRegistrationData {
+    fn into(self) -> EpollEvent {
+        let data: u64 = (self.user_data as u64) << 32 | (self.pollable as u64);
+        EpollEvent::new(self.monitored_events, data)
+    }
+}
+
+impl Into<EventRegistrationData> for EpollEvent {
+    fn into(self) -> EventRegistrationData {
+        EventRegistrationData {
+            pollable: self.data() as u32 as i32,
+            user_data: (self.data() >> 32) as u32,
+            monitored_events: self.event_set()
+        }
     }
 }
 
@@ -94,7 +124,7 @@ impl EventManager {
     }
 
     /// Returns a clone of the subscriber associated with the `fd`.
-    pub fn subscriber(&self, fd: Pollable) -> Result<Arc<Mutex<dyn Subscriber>>> {
+    pub fn subscriber(&self, fd: Pollable) -> Result<Arc<Mutex<dyn EventSubscriber>>> {
         self.subscribers
             .get(&fd)
             .ok_or(Error::NotFound(fd))
@@ -107,12 +137,12 @@ impl EventManager {
     // subscriber to call `register` directly when it needs to register an event and not have
     // all events registered at once. This way we can also remove the `interest_list` which is
     // only used once in this function.
-    pub fn add_subscriber(&mut self, subscriber: Arc<Mutex<dyn Subscriber>>) -> Result<()> {
+    pub fn add_subscriber(&mut self, subscriber: Arc<Mutex<dyn EventSubscriber>>) -> Result<()> {
         // Unwrapping here is safe because we want to panic in case the lock is poisoned.
         let interest_list = subscriber.lock().unwrap().interest_list();
 
         for event in interest_list {
-            self.register(event.data() as i32, event, subscriber.clone())?
+            self.register(event.into(), subscriber.clone())?
         }
 
         Ok(())
@@ -122,16 +152,17 @@ impl EventManager {
     /// for `subscriber`.
     pub fn register(
         &mut self,
-        pollable: Pollable,
-        epoll_event: EpollEvent,
-        subscriber: Arc<Mutex<dyn Subscriber>>,
+        event_registration_data: EventRegistrationData,
+        subscriber: Arc<Mutex<dyn EventSubscriber>>,
     ) -> Result<()> {
+        let pollable = event_registration_data.pollable;
+
         if self.subscribers.contains_key(&pollable) {
             return Err(Error::AlreadyExists(pollable));
         };
 
         self.epoll
-            .ctl(epoll::ControlOperation::Add, pollable, epoll_event)
+            .ctl(epoll::ControlOperation::Add, pollable, event_registration_data.into())
             .map_err(Error::Poll)?;
 
         self.subscribers.insert(pollable, subscriber);
@@ -139,29 +170,32 @@ impl EventManager {
     }
 
     /// Unregister the `pollable` file descriptor.
-    pub fn unregister(&mut self, pollable: Pollable) -> Result<()> {
-        match self.subscribers.remove(&pollable) {
+    pub fn unregister<T: AsRawFd>(&mut self, pollable: &T) -> Result<()> {
+        // TODO: should we check that as_raw_fd() > -1?
+        match self.subscribers.remove(&pollable.as_raw_fd()) {
             Some(_) => {
                 self.epoll
                     .ctl(
                         epoll::ControlOperation::Delete,
-                        pollable,
+                        pollable.as_raw_fd(),
                         epoll::EpollEvent::default(),
                     )
                     .map_err(Error::Poll)?;
             }
             None => {
-                return Err(Error::NotFound(pollable));
+                return Err(Error::NotFound(pollable.as_raw_fd()));
             }
         }
         Ok(())
     }
 
     /// Update the events monitored by `pollable`.
-    pub fn modify(&mut self, pollable: Pollable, epoll_event: EpollEvent) -> Result<()> {
+    pub fn modify(&mut self, event_registration_data: EventRegistrationData) -> Result<()> {
+        let pollable = event_registration_data.pollable;
+
         if self.subscribers.contains_key(&pollable) {
             self.epoll
-                .ctl(epoll::ControlOperation::Modify, pollable, epoll_event)
+                .ctl(epoll::ControlOperation::Modify, pollable, event_registration_data.into())
                 .map_err(Error::Poll)?;
         } else {
             return Err(Error::NotFound(pollable));
@@ -204,7 +238,7 @@ impl EventManager {
                     .clone()
                     .lock()
                     .unwrap()
-                    .process(event, self);
+                    .process(event.into(), self);
             }
             // TODO: Should we log an error in case the subscriber does not exist?
         }
@@ -284,8 +318,10 @@ mod tests {
             if self.register_ev2 {
                 event_manager
                     .register(
-                        self.event_fd_2.as_raw_fd(),
-                        EpollEvent::new(EventSet::OUT, self.event_fd_2.as_raw_fd() as u64),
+                        EventRegistrationData::new(
+                            &self.event_fd_2,
+                            EventSet::OUT,
+                        ),
                         event_manager
                             .subscriber(self.event_fd_1.as_raw_fd())
                             .unwrap(),
@@ -296,7 +332,7 @@ mod tests {
 
             if self.unregister_ev1 {
                 event_manager
-                    .unregister(self.event_fd_1.as_raw_fd())
+                    .unregister(&self.event_fd_1)
                     .unwrap();
                 self.unregister_ev1 = false;
             }
@@ -304,8 +340,10 @@ mod tests {
             if self.modify_ev1 {
                 event_manager
                     .modify(
-                        self.event_fd_1.as_raw_fd(),
-                        EpollEvent::new(EventSet::IN, self.event_fd_1.as_raw_fd() as u64),
+                        EventRegistrationData::new(
+                            &self.event_fd_1,
+                            EventSet::IN
+                        )
                     )
                     .unwrap();
                 self.modify_ev1 = false;
@@ -331,10 +369,10 @@ mod tests {
         }
     }
 
-    impl Subscriber for DummySubscriber {
-        fn process(&mut self, event: EpollEvent, event_manager: &mut EventManager) {
-            let source = event.data() as i32;
-            let event_set = EventSet::from_bits(event.events()).unwrap();
+    impl EventSubscriber for DummySubscriber {
+        fn process(&mut self, event: EventRegistrationData, event_manager: &mut EventManager) {
+            let source = event.fd();
+            let event_set = event.event_set();
 
             // We only know how to treat EPOLLOUT and EPOLLIN.
             // If we received anything else just stop processing the event.
@@ -352,10 +390,10 @@ mod tests {
             }
         }
 
-        fn interest_list(&self) -> Vec<EpollEvent> {
-            vec![EpollEvent::new(
+        fn interest_list(&self) -> Vec<EventRegistrationData> {
+            vec![EventRegistrationData::new(
+                &self.event_fd_1,
                 EventSet::OUT,
-                self.event_fd_1.as_raw_fd() as u64,
             )]
         }
     }
@@ -465,15 +503,15 @@ mod tests {
 
         // At this point ev2 is not registered. Check that unregistering it throws an error.
         assert!(event_manager
-            .unregister(dummy_subscriber.lock().unwrap().event_fd_2.as_raw_fd())
+            .unregister(&dummy_subscriber.lock().unwrap().event_fd_2)
             .is_err());
 
         // Try to unregister ev1 twice. Only the first call should be successful.
         assert!(event_manager
-            .unregister(dummy_subscriber.lock().unwrap().event_fd_1.as_raw_fd())
+            .unregister(&dummy_subscriber.lock().unwrap().event_fd_1)
             .is_ok());
         assert!(event_manager
-            .unregister(dummy_subscriber.lock().unwrap().event_fd_1.as_raw_fd())
+            .unregister(&dummy_subscriber.lock().unwrap().event_fd_1)
             .is_err());
     }
 

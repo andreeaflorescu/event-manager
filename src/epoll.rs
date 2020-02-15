@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io;
-use std::ops::Deref;
+use std::ops::{Deref, Drop};
 use std::os::raw::c_int;
 use std::os::unix::io::{AsRawFd, RawFd};
 
@@ -128,8 +128,11 @@ impl EpollEvent {
 
     /// Returns the `EventSet` corresponding to `epoll_event.events` or
     /// None if the events are invalid.
-    pub fn event_set(&self) -> Option<EventSet> {
-        EventSet::from_bits(self.events())
+    pub fn event_set(&self) -> EventSet {
+        // This unwrap should not fail because EpollEvent can only be created from a valid EventSet
+        // or created by the kernel (in which case we trust the kernel to not pass garbage in
+        // `events`).
+        EventSet::from_bits(self.events()).unwrap()
     }
 
     /// Returns the `data` from the `libc::epoll_event`.
@@ -147,7 +150,7 @@ impl EpollEvent {
 }
 
 /// Wrapper over epoll functionality.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct Epoll {
     epoll_fd: RawFd,
 }
@@ -169,7 +172,7 @@ impl Epoll {
     /// * `operation` refers to the action to be performed on the file descriptor.
     /// * `fd` is the file descriptor on which we want to perform `operation`.
     /// * `event` refers to the `epoll_event` instance that is linked to `fd`.
-    pub fn ctl(self, operation: ControlOperation, fd: RawFd, event: EpollEvent) -> io::Result<()> {
+    pub fn ctl(&self, operation: ControlOperation, fd: RawFd, event: EpollEvent) -> io::Result<()> {
         // We copy here `event` in order to obtain a mutable Event as this is a requirement
         // from `epoll_ctl()` signature even if this syscall doesn't actually mutate the object.
         let mut event_as_mut = event;
@@ -200,7 +203,7 @@ impl Epoll {
     /// * `events` points to a memory area that will be used for storing the events
     /// returned by `epoll_wait()` call.
     pub fn wait(
-        self,
+        &self,
         max_events: usize,
         timeout: i32,
         events: &mut [EpollEvent],
@@ -228,6 +231,16 @@ impl AsRawFd for Epoll {
     }
 }
 
+impl Drop for Epoll {
+    fn drop(&mut self) {
+        // Safe because this fd is opened with `epoll_create` and we trust
+        // the kernel to give us a valid fd.
+        unsafe {
+            libc::close(self.epoll_fd);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,7 +255,7 @@ mod tests {
 
         event = EpollEvent::new(EventSet::IN, 2);
         assert_eq!(event.events(), 1);
-        assert_eq!(event.event_set().unwrap(), EventSet::IN);
+        assert_eq!(event.event_set(), EventSet::IN);
 
         assert_eq!(event.data(), 2);
         assert_eq!(event.fd(), 2);
