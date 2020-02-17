@@ -101,7 +101,7 @@ impl Into<EventRegistrationData> for EpollEvent {
         EventRegistrationData {
             pollable: self.data() as u32 as i32,
             user_data: (self.data() >> 32) as u32,
-            monitored_events: self.event_set()
+            monitored_events: self.event_set(),
         }
     }
 }
@@ -162,7 +162,11 @@ impl EventManager {
         };
 
         self.epoll
-            .ctl(epoll::ControlOperation::Add, pollable, event_registration_data.into())
+            .ctl(
+                epoll::ControlOperation::Add,
+                pollable,
+                event_registration_data.into(),
+            )
             .map_err(Error::Poll)?;
 
         self.subscribers.insert(pollable, subscriber);
@@ -195,7 +199,11 @@ impl EventManager {
 
         if self.subscribers.contains_key(&pollable) {
             self.epoll
-                .ctl(epoll::ControlOperation::Modify, pollable, event_registration_data.into())
+                .ctl(
+                    epoll::ControlOperation::Modify,
+                    pollable,
+                    event_registration_data.into(),
+                )
                 .map_err(Error::Poll)?;
         } else {
             return Err(Error::NotFound(pollable));
@@ -318,10 +326,7 @@ mod tests {
             if self.register_ev2 {
                 event_manager
                     .register(
-                        EventRegistrationData::new(
-                            &self.event_fd_2,
-                            EventSet::OUT,
-                        ),
+                        EventRegistrationData::new(&self.event_fd_2, EventSet::OUT),
                         event_manager
                             .subscriber(self.event_fd_1.as_raw_fd())
                             .unwrap(),
@@ -331,20 +336,13 @@ mod tests {
             }
 
             if self.unregister_ev1 {
-                event_manager
-                    .unregister(&self.event_fd_1)
-                    .unwrap();
+                event_manager.unregister(&self.event_fd_1).unwrap();
                 self.unregister_ev1 = false;
             }
 
             if self.modify_ev1 {
                 event_manager
-                    .modify(
-                        EventRegistrationData::new(
-                            &self.event_fd_1,
-                            EventSet::IN
-                        )
-                    )
+                    .modify(EventRegistrationData::new(&self.event_fd_1, EventSet::IN))
                     .unwrap();
                 self.modify_ev1 = false;
             }
@@ -391,10 +389,7 @@ mod tests {
         }
 
         fn interest_list(&self) -> Vec<EventRegistrationData> {
-            vec![EventRegistrationData::new(
-                &self.event_fd_1,
-                EventSet::OUT,
-            )]
+            vec![EventRegistrationData::new(&self.event_fd_1, EventSet::OUT)]
         }
     }
 
