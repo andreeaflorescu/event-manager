@@ -1,95 +1,126 @@
 use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::result::Result;
 
-use crate::epoll::{Epoll, EventSet};
+use crate::epoll::{Epoll, EpollEvent, EventSet};
 
-pub trait SubscriberEvents {
-    // We might consider going for interior mutability here (methods require &self instead of
-    // &mut self).
+pub enum Error {}
 
-    fn add(&mut self, source: &dyn AsRawFd, events: EventSet, data: u32) {
-        self.add_raw(source.as_raw_fd(), events, data);
-    }
-    fn modify(&mut self, source: &dyn AsRawFd, events: EventSet, data: u32) {
-        self.modify_raw(source.as_raw_fd(), events, data);
-    }
-    fn delete(&mut self, source: &dyn AsRawFd) {
-        self.delete_raw(source.as_raw_fd());
-    }
-
-    fn add_raw(&mut self, source: RawFd, events: EventSet, data: u32);
-    fn modify_raw(&mut self, source: RawFd, events: EventSet, data: u32);
-    fn delete_raw(&mut self, source: RawFd);
+pub struct Events {
+    inner: EpollEvent,
 }
 
-pub trait EventSubscriber {
-    fn process(
-        &mut self,
-        fd: RawFd,
-        data: u32,
-        events: EventSet,
-        subscriber_events: &mut dyn SubscriberEvents,
-    );
-    fn init(&self, subscriber_events: &mut dyn SubscriberEvents);
+impl Events {
+    pub fn new<T: AsRawFd>(source: &T, events: EventSet) -> Self {
+        Self::new_raw(source.as_raw_fd(), events)
+    }
+
+    pub fn new_raw(source: RawFd, events: EventSet) -> Self {
+        Self::with_data_raw(source, 0, events)
+    }
+
+    pub fn with_data<T: AsRawFd>(source: &T, data: u32, events: EventSet) -> Self {
+        Self::with_data_raw(source.as_raw_fd(), data, events)
+    }
+
+    pub fn with_data_raw(source: RawFd, data: u32, events: EventSet) -> Self {
+        let inner_data = (source as u64) << 32 + data as u64;
+        Events {
+            inner: EpollEvent::new(events, inner_data),
+        }
+    }
+
+    pub fn fd(&self) -> RawFd {
+        self.inner.data() as RawFd
+    }
+
+    pub fn data(&self) -> u32 {
+        (self.inner.data() >> 32) as u32
+    }
+
+    pub fn event_set(&self) -> EventSet {
+        self.inner.event_set()
+    }
 }
 
-pub trait SubscriberOps {
-    type Subscriber: EventSubscriber;
-
-    fn add_subscriber(&mut self, subscriber: Self::Subscriber);
+#[derive(Clone, Copy)]
+pub struct SubscriberToken {
+    index: usize,
 }
 
-pub trait EventManager: SubscriberOps {}
-
-struct DummyManager<T> {
+pub struct EventManager<T> {
     epoll: Epoll,
     subscribers: Vec<T>,
     fd_dispatch: HashMap<RawFd, usize>,
 }
 
-impl<T: EventSubscriber> DummyManager<T> {
-    fn dispatch_events(&mut self, fd: RawFd, data: u32, events: EventSet) {
-        // unwrapping for now
-        let token = *self.fd_dispatch.get(&fd).unwrap();
-        let subscriber = &mut self.subscribers[token];
-        let mut blah = Blah::new(&mut self.epoll, &mut self.fd_dispatch, token);
-        subscriber.process(fd, data, events, &mut blah);
+impl<T: EventSubscriber> EventManager<T> {
+    pub fn add_subscriber(&mut self, subscriber: T) -> SubscriberToken {
+        self.subscribers.push(subscriber);
+        let token = SubscriberToken {
+            index: self.subscribers.len() - 1,
+        };
+
+        let registered_events = RegisteredEvents::new(&self.epoll, &mut self.fd_dispatch, &token);
+        self.subscribers[token.index].init(&registered_events);
+        token
+    }
+
+    pub fn remove_subscriber(&mut self, token: SubscriberToken) -> Result<T, Error> {
+        unimplemented!()
+    }
+
+    pub fn subscriber(&self, token: SubscriberToken) -> Result<&T, Error> {
+        unimplemented!()
+    }
+
+    pub fn subscriber_mut(&mut self, token: SubscriberToken) -> Result<&mut T, Error> {
+        unimplemented!()
     }
 }
 
-impl<T: EventSubscriber> SubscriberOps for DummyManager<T> {
-    type Subscriber = T;
-
-    fn add_subscriber(&mut self, subscriber: T) {
-        self.subscribers.push(subscriber)
-    }
-}
-
-struct Blah<'a> {
-    epoll: &'a mut Epoll,
+pub struct RegisteredEvents<'a> {
+    epoll: &'a Epoll,
     fd_dispatch: &'a mut HashMap<RawFd, usize>,
-    token: usize,
+    token: &'a SubscriberToken,
 }
 
-impl<'a> Blah<'a> {
-    fn new(epoll: &'a mut Epoll, fd_dispatch: &'a mut HashMap<RawFd, usize>, token: usize) -> Self {
-        Blah {
+impl<'a> RegisteredEvents<'a> {
+    fn new(
+        epoll: &'a Epoll,
+        fd_dispatch: &'a mut HashMap<RawFd, usize>,
+        token: &'a SubscriberToken,
+    ) -> Self {
+        RegisteredEvents {
             epoll,
             fd_dispatch,
             token,
         }
     }
+
+    pub fn add(&self, events: Events) {}
+
+    pub fn modify(&self, events: Events) {}
+
+    pub fn remove<T: AsRawFd>(&self, events: Events) {}
 }
 
-impl<'a> SubscriberEvents for Blah<'a> {
-    fn add_raw(&mut self, source: RawFd, events: EventSet, data: u32) {
-        self.fd_dispatch.insert(source, self.token);
-        // also register actual events with epoll
-    }
-    fn modify_raw(&mut self, source: RawFd, events: EventSet, data: u32) {
+pub struct EventManagerEndpoint<T> {
+    blah: T,
+}
+
+impl<T: EventSubscriber> EventManagerEndpoint<T> {
+    pub fn invoke<F, O, E>(&self, f: Box<F>) -> Result<O, E>
+    where
+        F: FnOnce(&mut EventManager<T>) -> Result<O, E> + Send,
+        O: Send,
+        E: From<Error> + Send,
+    {
         unimplemented!()
     }
-    fn delete_raw(&mut self, source: RawFd) {
-        unimplemented!()
-    }
+}
+
+pub trait EventSubscriber {
+    fn process(&mut self, events: Events, registered_events: &RegisteredEvents);
+    fn init(&self, registered_events: &RegisteredEvents);
 }
