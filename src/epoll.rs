@@ -94,6 +94,12 @@ impl EventSet {
 #[derive(Clone, Copy)]
 pub struct EpollEvent(epoll_event);
 
+impl std::fmt::Debug for EpollEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "({:?}, {:?})", self.events(), self.data())
+    }
+}
+
 impl Deref for EpollEvent {
     type Target = epoll_event;
     fn deref(&self) -> &Self::Target {

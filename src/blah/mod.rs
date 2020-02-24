@@ -16,7 +16,7 @@ pub enum Error {
     InvalidToken,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Events {
     inner: EpollEvent,
 }
@@ -43,7 +43,7 @@ impl Events {
     }
 
     pub fn with_data_raw(source: RawFd, data: u32, events: EventSet) -> Self {
-        let inner_data = (source as u64) << 32 + data as u64;
+        let inner_data = ((data as u64) << 32) + (source as u64);
         Events {
             inner: EpollEvent::new(events, inner_data),
         }
@@ -82,6 +82,6 @@ impl<S: EventSubscriber> SubscriberOpsEndpoint<S> {
 }
 
 pub trait EventSubscriber {
-    fn process(&mut self, events: Events, ops: &ControlOps);
-    fn init(&self, ops: &ControlOps);
+    fn process(&mut self, events: Events, ops: &mut ControlOps);
+    fn init(&self, ops: &mut ControlOps);
 }
