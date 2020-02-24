@@ -22,12 +22,14 @@ pub trait SubscriberOps {
 
 pub struct EventManager<T> {
     epoll: Epoll,
-    subscribers: Vec<(Option<T>, u128)>,
+    ready_events: Vec<EpollEvent>,
+
     next_token_id: u128,
     free_sub_indices: Vec<usize>,
+
+    subscribers: Vec<(Option<T>, u128)>,
     fd_dispatch: HashMap<RawFd, usize>,
-    sub_fds: HashMap<usize, Vec<RawFd>>,
-    ready_events: Vec<EpollEvent>,
+    subscriber_watch_list: HashMap<usize, Vec<RawFd>>,
 }
 
 impl<T: EventSubscriber> SubscriberOps for EventManager<T> {
@@ -55,6 +57,7 @@ impl<T: EventSubscriber> SubscriberOps for EventManager<T> {
         let ops = ControlOps {
             epoll: &self.epoll,
             fd_dispatch: &mut self.fd_dispatch,
+            subscriber_watch_list: &mut self.subscriber_watch_list,
             subscriber_index: token.index,
         };
 
@@ -76,7 +79,7 @@ impl<T: EventSubscriber> SubscriberOps for EventManager<T> {
         let sub = maybe_sub.take().ok_or(Error::InvalidToken)?;
         self.free_sub_indices.push(token.index);
 
-        let fds = self.sub_fds.remove(&token.index).unwrap_or(Vec::new());
+        let fds = self.subscriber_watch_list.remove(&token.index).unwrap_or(Vec::new());
         for fd in fds {
             // We ignore the result of the operation since there's nothing we can't do, and its
             // not a significant error condition at this point.
@@ -104,7 +107,7 @@ impl<T: EventSubscriber> SubscriberOps for EventManager<T> {
 
     fn control_ops(&mut self, token: SubscriberToken) -> ControlOps {
         // TODO: verify whether token is valid!
-        ControlOps::new(&self.epoll, &mut self.fd_dispatch, token.index)
+        ControlOps::new(&self.epoll, &mut self.fd_dispatch, &mut self.subscriber_watch_list, token.index)
     }
 }
 
@@ -149,6 +152,7 @@ impl<T: EventSubscriber> EventManager<T> {
             let ops = ControlOps {
                 epoll: &self.epoll,
                 fd_dispatch: &mut self.fd_dispatch,
+                subscriber_watch_list: &mut self.subscriber_watch_list,
                 subscriber_index: sub_index,
             };
             subscriber.process(Events { inner: event }, &ops);
@@ -159,6 +163,7 @@ impl<T: EventSubscriber> EventManager<T> {
 pub struct ControlOps<'a> {
     epoll: &'a Epoll,
     fd_dispatch: &'a mut HashMap<RawFd, usize>,
+    subscriber_watch_list: &'a mut HashMap<usize, Vec<RawFd>>,
     subscriber_index: usize,
 }
 
@@ -166,11 +171,13 @@ impl<'a> ControlOps<'a> {
     fn new(
         epoll: &'a Epoll,
         fd_dispatch: &'a mut HashMap<RawFd, usize>,
+        subscriber_watch_list: &'a mut HashMap<usize, Vec<RawFd>>,
         subscriber_index: usize,
     ) -> Self {
         ControlOps {
             epoll,
             fd_dispatch,
+            subscriber_watch_list,
             subscriber_index,
         }
     }
@@ -188,6 +195,7 @@ impl<'a> ControlOps<'a> {
         }
         self.ctl(ControlOperation::Add, events)?;
         self.fd_dispatch.insert(fd, self.subscriber_index);
+        self.subscriber_watch_list.get_mut(&self.subscriber_index).unwrap().push(fd);
         Ok(())
     }
 
@@ -199,6 +207,11 @@ impl<'a> ControlOps<'a> {
         // TODO: Add some more checks here?
         self.ctl(ControlOperation::Delete, events)?;
         self.fd_dispatch.remove(&events.fd());
+        // TODO: don't unwrap here.
+        let watch_list = self.subscriber_watch_list.get_mut(&self.subscriber_index).unwrap();
+        // TODO: do not unwrap here.
+        let index = watch_list.iter().position(|x| *x == events.fd()).unwrap();
+        watch_list.remove(index);
         Ok(())
     }
 }
