@@ -24,32 +24,32 @@ impl<T: EventSubscriber> SubscriberOps for EventManager<T> {
     /// Register a subscriber with the event event_manager and returns the associated token.
     fn add_subscriber(&mut self, subscriber: T) -> SubscriberToken {
         let token = self.subscribers.add(subscriber);
-        let index = token.index;
         self.subscribers
-            .get_mut(index)
-            // The index is valid because we've just added the subscriber.
-            .init(&mut self.epoll_context.ops_unchecked(index));
+            .get_mut(token)
+            // The object is valid because we've just added the subscriber.
+            .unwrap()
+            .init(&mut self.epoll_context.ops_unchecked(token.id as usize));
         token
     }
 
     /// Unregisters and returns the subscriber associated with the provided token.
     fn remove_subscriber(&mut self, token: SubscriberToken) -> Result<T> {
         let subscriber = self.subscribers.remove(token).ok_or(Error::InvalidToken)?;
-        self.epoll_context.remove(token.index);
+        self.epoll_context.remove(token.id as usize);
         Ok(subscriber)
     }
 
     /// Return a mutable reference to the subscriber associated with the provided token.
     fn subscriber_mut(&mut self, token: SubscriberToken) -> Result<&mut T> {
-        self.subscribers.find(token).ok_or(Error::InvalidToken)
+        self.subscribers.get_mut(token).ok_or(Error::InvalidToken)
     }
 
     /// Returns a `ControlOps` object for the subscriber associated with the provided token.
     fn control_ops(&mut self, token: SubscriberToken) -> Result<ControlOps> {
         // Check if the token is valid.
-        if self.subscribers.find(token).is_some() {
+        if self.subscribers.get_mut(token).is_some() {
             // The index is valid because the result of `find` was not `None`.
-            return Ok(self.epoll_context.ops_unchecked(token.index));
+            return Ok(self.epoll_context.ops_unchecked(token.id as usize));
         }
         Err(Error::InvalidToken)
     }
@@ -144,9 +144,12 @@ impl<S: EventSubscriber> EventManager<S> {
             };
 
             self.subscribers
-                .get_mut(sub_index)
+                .get_mut(SubscriberToken {
+                    id: sub_index as u128,
+                })
                 // The index is valid because the previous call to `context.subscriber_index` did
                 // not return `None`.
+                .unwrap()
                 .process(
                     Events::with_inner(event),
                     &mut self.epoll_context.ops_unchecked(sub_index),
@@ -407,7 +410,6 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(token.index, 0);
         assert_eq!(token.id, 0);
 
         thread_handle.join().unwrap();

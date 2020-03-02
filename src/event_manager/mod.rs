@@ -31,9 +31,6 @@ pub type Result<T> = result::Result<T, Error>;
 /// Opaque object that uniquely represents a subscriber registered with an `EventManager`.
 #[derive(Clone, Copy, Debug)]
 pub struct SubscriberToken {
-    // We currently use a Vec to hold subscribers within the EventManager, and this is the
-    // position associated with the subscriber this token represents.
-    index: usize,
     // The unicity is ensured by using the 128bit id that's incremented on every add operation,
     // which virtually guarantees there will be no wrap-arounds or clashes.
     id: u128,
