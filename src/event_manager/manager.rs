@@ -23,33 +23,38 @@ impl<T: EventSubscriber> SubscriberOps for EventManager<T> {
 
     /// Register a subscriber with the event event_manager and returns the associated token.
     fn add_subscriber(&mut self, subscriber: T) -> SubscriberToken {
-        let token = self.subscribers.add(subscriber);
+        let id = self.subscribers.add(subscriber);
         self.subscribers
-            .get_mut(token)
+            .get_mut(id)
             // The object is valid because we've just added the subscriber.
             .unwrap()
-            .init(&mut self.epoll_context.ops_unchecked(token.id as usize));
-        token
+            .init(&mut self.epoll_context.ops_unchecked(id));
+        SubscriberToken { id }
     }
 
     /// Unregisters and returns the subscriber associated with the provided token.
     fn remove_subscriber(&mut self, token: SubscriberToken) -> Result<T> {
-        let subscriber = self.subscribers.remove(token).ok_or(Error::InvalidToken)?;
-        self.epoll_context.remove(token.id as usize);
+        let subscriber = self
+            .subscribers
+            .remove(token.id)
+            .ok_or(Error::InvalidToken)?;
+        self.epoll_context.remove(token.id);
         Ok(subscriber)
     }
 
     /// Return a mutable reference to the subscriber associated with the provided token.
     fn subscriber_mut(&mut self, token: SubscriberToken) -> Result<&mut T> {
-        self.subscribers.get_mut(token).ok_or(Error::InvalidToken)
+        self.subscribers
+            .get_mut(token.id)
+            .ok_or(Error::InvalidToken)
     }
 
     /// Returns a `ControlOps` object for the subscriber associated with the provided token.
     fn control_ops(&mut self, token: SubscriberToken) -> Result<ControlOps> {
         // Check if the token is valid.
-        if self.subscribers.get_mut(token).is_some() {
-            // The index is valid because the result of `find` was not `None`.
-            return Ok(self.epoll_context.ops_unchecked(token.id as usize));
+        if self.subscribers.get_mut(token.id).is_some() {
+            // The token.id is valid because the result of `get_mut` was `Some`.
+            return Ok(self.epoll_context.ops_unchecked(token.id));
         }
         Err(Error::InvalidToken)
     }
@@ -136,7 +141,7 @@ impl<S: EventSubscriber> EventManager<S> {
                 continue;
             }
 
-            let sub_index = if let Some(i) = self.epoll_context.subscriber_index(fd) {
+            let sub_id = if let Some(i) = self.epoll_context.subscriber_id(fd) {
                 i
             } else {
                 // TODO: Should we log an error in case the subscriber does not exist?
@@ -144,15 +149,13 @@ impl<S: EventSubscriber> EventManager<S> {
             };
 
             self.subscribers
-                .get_mut(SubscriberToken {
-                    id: sub_index as u128,
-                })
-                // The index is valid because the previous call to `context.subscriber_index` did
+                .get_mut(sub_id)
+                // The id is valid because the previous call to `context.subscriber_id` did
                 // not return `None`.
                 .unwrap()
                 .process(
                     Events::with_inner(event),
-                    &mut self.epoll_context.ops_unchecked(sub_index),
+                    &mut self.epoll_context.ops_unchecked(sub_id),
                 );
         }
     }

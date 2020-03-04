@@ -1,6 +1,7 @@
 use crate::epoll::ControlOperation;
 
 use super::epoll_context::EpollContext;
+use super::subscribers::SubscriberId;
 use super::{Error, Events, Result};
 
 /// This opaque object is associated with an `EventSubscriber`, and allows the addition,
@@ -11,16 +12,15 @@ use super::{Error, Events, Result};
 pub struct ControlOps<'a> {
     // Mutable reference to the EpollContext of an EventManager.
     epoll_context: &'a mut EpollContext,
-    // The index (within the subscribers member of the EventManager) of the event subscriber
-    // this object stands for.
-    subscriber_index: usize,
+    // The unique id of the event subscriber this object stands for.
+    subscriber_id: SubscriberId,
 }
 
 impl<'a> ControlOps<'a> {
-    pub(crate) fn new(epoll_context: &'a mut EpollContext, subscriber_index: usize) -> Self {
+    pub(crate) fn new(epoll_context: &'a mut EpollContext, subscriber_id: SubscriberId) -> Self {
         ControlOps {
             epoll_context,
-            subscriber_index,
+            subscriber_id,
         }
     }
 
@@ -43,11 +43,11 @@ impl<'a> ControlOps<'a> {
 
         self.epoll_context
             .fd_dispatch
-            .insert(fd, self.subscriber_index);
+            .insert(fd, self.subscriber_id);
 
         self.epoll_context
             .subscriber_watch_list
-            .entry(self.subscriber_index)
+            .entry(self.subscriber_id)
             .or_insert_with(Vec::new)
             .push(fd);
 
@@ -68,7 +68,7 @@ impl<'a> ControlOps<'a> {
         if let Some(watch_list) = self
             .epoll_context
             .subscriber_watch_list
-            .get_mut(&self.subscriber_index)
+            .get_mut(&self.subscriber_id)
         {
             if let Some(index) = watch_list.iter().position(|&x| x == events.fd()) {
                 watch_list.remove(index);
