@@ -6,16 +6,14 @@ use std::sync::{Arc, Mutex};
 use vmm_sys_util::epoll::{ControlOperation, EpollEvent, EventSet};
 
 use super::endpoint::EventManagerChannel;
-use super::epoll_context::EpollContext;
+use super::events::EventOperations;
 use super::subscribers::Subscribers;
-use super::{
-    ControlOps, Error, EventSubscriber, Events, RemoteEndpoint, Result, SubscriberId, SubscriberOps,
-};
+use super::{Error, EventSubscriber, Events, RemoteEndpoint, Result, SubscriberId, SubscriberOps};
 
 /// Allows event subscribers to be registered, connected to the event loop, and later removed.
 pub struct EventManager<T> {
     subscribers: Subscribers<T>,
-    epoll_context: EpollContext,
+    epoll_wrapper: EventOperations,
     ready_events: Vec<EpollEvent>,
     channel: EventManagerChannel<T>,
 }
@@ -29,7 +27,7 @@ impl<T: EventSubscriber> SubscriberOps for EventManager<T> {
         self.subscribers
             .get_mut_unchecked(subscriber_id)
             // The index is valid because we've just added the subscriber.
-            .init(&mut self.epoll_context.ops_unchecked(subscriber_id));
+            .init(subscriber_id, &mut self.epoll_wrapper);
         subscriber_id
     }
 
@@ -39,7 +37,7 @@ impl<T: EventSubscriber> SubscriberOps for EventManager<T> {
             .subscribers
             .remove(subscriber_id)
             .ok_or(Error::InvalidId)?;
-        self.epoll_context.remove(subscriber_id);
+        self.epoll_wrapper.remove_subscriber(subscriber_id);
         Ok(subscriber)
     }
 
@@ -50,26 +48,16 @@ impl<T: EventSubscriber> SubscriberOps for EventManager<T> {
         }
         Err(Error::InvalidId)
     }
-
-    /// Returns a `ControlOps` object for the subscriber associated with the provided ID.
-    fn control_ops(&mut self, subscriber_id: SubscriberId) -> Result<ControlOps> {
-        // Check if the subscriber_id is valid.
-        if self.subscribers.contains(subscriber_id) {
-            // The index is valid because the result of `find` was not `None`.
-            return Ok(self.epoll_context.ops_unchecked(subscriber_id));
-        }
-        Err(Error::InvalidId)
-    }
 }
 
 // TODO: add implementations for other standard wrappers as well.
 impl EventSubscriber for Arc<Mutex<dyn EventSubscriber>> {
-    fn process(&mut self, events: Events, ops: &mut ControlOps) {
+    fn process(&mut self, events: Events, ops: &mut EventOperations) {
         self.lock().unwrap().process(events, ops);
     }
 
-    fn init(&self, ops: &mut ControlOps) {
-        self.lock().unwrap().init(ops);
+    fn init(&self, subscriber_id: SubscriberId, ops: &mut EventOperations) {
+        self.lock().unwrap().init(subscriber_id, ops);
     }
 }
 
@@ -78,14 +66,14 @@ impl<S: EventSubscriber> EventManager<S> {
     pub fn new() -> Result<Self> {
         let manager = EventManager {
             subscribers: Subscribers::new(),
-            epoll_context: EpollContext::new()?,
+            epoll_wrapper: EventOperations::new()?,
             ready_events: vec![EpollEvent::default(); 256],
             channel: EventManagerChannel::new()?,
         };
 
         let fd = manager.channel.fd();
         manager
-            .epoll_context
+            .epoll_wrapper
             .epoll
             .ctl(
                 ControlOperation::Add,
@@ -107,15 +95,14 @@ impl<S: EventSubscriber> EventManager<S> {
     /// registered signal handlers.
     pub fn run_with_timeout(&mut self, milliseconds: i32) -> Result<usize> {
         let event_count = self
-            .epoll_context
+            .epoll_wrapper
             .epoll
             .wait(
                 self.ready_events.len(),
                 milliseconds,
                 &mut self.ready_events[..],
             )
-            // .map_err(Error::Poll)?;
-            .expect("TODO error handling");
+            .map_err(Error::Epoll)?;
         self.dispatch_events(event_count);
 
         Ok(event_count)
@@ -143,7 +130,7 @@ impl<S: EventSubscriber> EventManager<S> {
                 continue;
             }
 
-            let sub_index = if let Some(i) = self.epoll_context.subscriber_id(fd) {
+            let sub_index = if let Some(i) = self.epoll_wrapper.subscriber_id(fd) {
                 i
             } else {
                 // TODO: Should we log an error in case the subscriber does not exist?
@@ -154,10 +141,7 @@ impl<S: EventSubscriber> EventManager<S> {
                 .get_mut_unchecked(sub_index)
                 // The index is valid because the previous call to `context.subscriber_index` did
                 // not return `None`.
-                .process(
-                    Events::with_inner(event),
-                    &mut self.epoll_context.ops_unchecked(sub_index),
-                );
+                .process(Events::with_inner(event), &mut self.epoll_wrapper);
         }
     }
 
@@ -250,27 +234,30 @@ mod tests {
             self.processed_ev1_in = false;
         }
 
-        fn handle_updates(&mut self, event_manager: &mut ControlOps) {
+        fn handle_updates(&mut self, event_manager: &mut EventOperations) {
             if self.register_ev2 {
                 event_manager
-                    .add(Events::new(&self.event_fd_2, EventSet::OUT))
+                    .add(
+                        Events::new(&self.event_fd_2, EventSet::OUT),
+                        SubscriberId(1),
+                    )
                     .unwrap();
                 self.register_ev2 = false;
             }
 
             if self.unregister_ev1 {
                 event_manager
-                    .remove(Events::new_raw(
-                        self.event_fd_1.as_raw_fd(),
-                        EventSet::empty(),
-                    ))
+                    .remove(
+                        Events::new_raw(self.event_fd_1.as_raw_fd(), EventSet::empty()),
+                        SubscriberId(1),
+                    )
                     .unwrap();
                 self.unregister_ev1 = false;
             }
 
             if self.modify_ev1 {
                 event_manager
-                    .modify(Events::new(&self.event_fd_1, EventSet::IN))
+                    .modify(Events::new(&self.event_fd_1, EventSet::IN), SubscriberId(1))
                     .unwrap();
                 self.modify_ev1 = false;
             }
@@ -296,7 +283,7 @@ mod tests {
     }
 
     impl EventSubscriber for DummySubscriber {
-        fn process(&mut self, events: Events, ops: &mut ControlOps) {
+        fn process(&mut self, events: Events, ops: &mut EventOperations) {
             let source = events.fd();
             let event_set = events.event_set();
 
@@ -316,9 +303,9 @@ mod tests {
             }
         }
 
-        fn init(&self, ops: &mut ControlOps) {
+        fn init(&self, subscriber_id: SubscriberId, ops: &mut EventOperations) {
             let event = Events::new(&self.event_fd_1, EventSet::OUT);
-            ops.add(event).unwrap();
+            ops.add(event, subscriber_id).unwrap();
         }
     }
 

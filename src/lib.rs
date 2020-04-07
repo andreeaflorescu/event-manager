@@ -1,8 +1,6 @@
 // Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
-mod control_ops;
 mod endpoint;
-mod epoll_context;
 mod events;
 pub mod manager;
 mod subscribers;
@@ -10,9 +8,10 @@ mod subscribers;
 use std::io;
 use std::result;
 
-pub use control_ops::ControlOps;
 pub use endpoint::RemoteEndpoint;
-pub use events::Events;
+// For the outside world, EpollWrapper is actually just a structure that offers
+// operations for updating events.
+pub use events::{EventOperations, Events};
 pub use manager::EventManager;
 
 /// Error conditions that may appear during `EventManager` related operations.
@@ -25,6 +24,7 @@ pub enum Error {
     // TODO: should we allow fds to be registered multiple times?
     FdAlreadyRegistered,
     InvalidId,
+    InvalidEvent,
 }
 
 /// Generic result type that may return `EventManager` errors.
@@ -40,12 +40,12 @@ pub trait EventSubscriber {
     /// Respond to events and potentially alter the interest set of the subscriber.
     ///
     /// Called by the `EventManager` whenever an event associated with the subscriber is triggered.
-    fn process(&mut self, events: Events, ops: &mut ControlOps);
+    fn process(&mut self, events: Events, ops: &mut EventOperations);
 
     /// Register the events initially associated with the subscriber.
     ///
     /// Called by the `EventManager` after a subscriber is registered.
-    fn init(&self, ops: &mut ControlOps);
+    fn init(&self, subcriber_id: SubscriberId, ops: &mut EventOperations);
 }
 
 /// Represents the part of the event event_manager API that allows users to add, remove, and
@@ -56,5 +56,4 @@ pub trait SubscriberOps {
     fn add_subscriber(&mut self, subscriber: Self::Subscriber) -> SubscriberId;
     fn remove_subscriber(&mut self, subscriber_id: SubscriberId) -> Result<Self::Subscriber>;
     fn subscriber_mut(&mut self, subscriber_id: SubscriberId) -> Result<&mut Self::Subscriber>;
-    fn control_ops(&mut self, subscriber_id: SubscriberId) -> Result<ControlOps>;
 }

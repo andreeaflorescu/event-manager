@@ -1,9 +1,11 @@
 // Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd, RawFd};
 
-use vmm_sys_util::epoll::{EpollEvent, EventSet};
+use super::{Error, Result, SubscriberId};
+use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 
 /// Wrapper over an `epoll::EpollEvent` object.
 ///
@@ -82,6 +84,118 @@ impl Events {
     /// Return the inner `EpollEvent`.
     pub fn epoll_event(&self) -> EpollEvent {
         self.inner
+    }
+}
+
+/// Wrapper over operations that can be executed on `Events`.
+// External uses of this structure provide operations that can be executed on Events.
+// Internally, this is also used as an `Epoll` wrapper.
+pub struct EventOperations {
+    // The epoll wrapper.
+    pub(crate) epoll: Epoll,
+    // Records the id of the subscriber associated with the given RawFd. The event event_manager
+    // does not currently support more than one subscriber being associated with an fd.
+    fd_dispatch: HashMap<RawFd, SubscriberId>,
+    // Records the set of fds that are associated with the subscriber that has the given id.
+    // This is used to keep track of all fds associated with a subscriber.
+    subscriber_watch_list: HashMap<SubscriberId, Vec<RawFd>>,
+}
+
+impl EventOperations {
+    pub(crate) fn new() -> Result<Self> {
+        Ok(EventOperations {
+            epoll: Epoll::new().map_err(Error::Epoll)?,
+            fd_dispatch: HashMap::new(),
+            subscriber_watch_list: HashMap::new(),
+        })
+    }
+
+    pub fn modify(&self, event: Events, id: SubscriberId) -> Result<()> {
+        if !self.subscriber_event_is_valid(event, id) {
+            return Err(Error::InvalidEvent);
+        }
+
+        self.epoll
+            .ctl(ControlOperation::Modify, event.fd(), event.epoll_event())
+            .map_err(Error::Epoll)
+    }
+
+    // Remove the `event` associated with the `SubscriberId`. If no such event
+    // exists, an error is returned.
+    pub fn remove(&mut self, event: Events, id: SubscriberId) -> Result<()> {
+        if !self.subscriber_event_is_valid(event, id) {
+            return Err(Error::InvalidEvent);
+        }
+
+        self.epoll
+            .ctl(ControlOperation::Delete, event.fd(), event.epoll_event())
+            .map_err(Error::Epoll)?;
+        self.fd_dispatch.remove(&event.fd());
+
+        // TODO: If the event is valid, shouldn't it always be present in the
+        // watch_list? In which case shouldn't we panic if it doesn't exist instead of
+        // actually trying to remove it only if it exists?
+        if let Some(watch_list) = self.subscriber_watch_list.get_mut(&id) {
+            if let Some(index) = watch_list.iter().position(|&x| x == event.fd()) {
+                watch_list.remove(index);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn add(&mut self, event: Events, id: SubscriberId) -> Result<()> {
+        let fd = event.fd();
+        if self.fd_dispatch.contains_key(&fd) {
+            return Err(Error::FdAlreadyRegistered);
+        }
+
+        self.epoll
+            .ctl(ControlOperation::Add, event.fd(), event.epoll_event())
+            .map_err(Error::Epoll)?;
+
+        self.fd_dispatch.insert(fd, id);
+
+        self.subscriber_watch_list
+            .entry(id)
+            .or_insert_with(Vec::new)
+            .push(fd);
+
+        Ok(())
+    }
+
+    // Helper function to check that the pair (event, subscriber_id) is valid.
+    fn subscriber_event_is_valid(&self, event: Events, id: SubscriberId) -> bool {
+        if !self.fd_dispatch.contains_key(&event.fd()) {
+            return false;
+        }
+
+        if *self.fd_dispatch.get(&event.fd()).unwrap() != id {
+            return false;
+        }
+        true
+    }
+
+    // Remove the fds associated with the provided subscriber id from the epoll set and the
+    // other structures. The subscriber id must be valid.
+    pub(crate) fn remove_subscriber(&mut self, subscriber_id: SubscriberId) {
+        let fds = self
+            .subscriber_watch_list
+            .remove(&subscriber_id)
+            .unwrap_or_else(Vec::new);
+        for fd in fds {
+            // We ignore the result of the operation since there's nothing we can't do, and its
+            // not a significant error condition at this point.
+            let _ = self
+                .epoll
+                .ctl(ControlOperation::Delete, fd, EpollEvent::default());
+            self.fd_dispatch.remove(&fd);
+        }
+    }
+
+    // Gets the id of the subscriber associated with the provided fd (if such an association
+    // exists).
+    pub(crate) fn subscriber_id(&self, fd: RawFd) -> Option<SubscriberId> {
+        self.fd_dispatch.get(&fd).copied()
     }
 }
 
