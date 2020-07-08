@@ -144,3 +144,28 @@ fn test_subsscriber_inner_mut() {
 
     assert_eq!(subscriber.counter(), 100);
 }
+
+#[test]
+fn test_subsscriber_inner_mut_2() {
+    let mut event_manager = EventManager::<Box<dyn EventSubscriber + Send + Sync>>::new()
+        .expect("Cannot create event manager");
+
+    let subscriber = Box::new(CounterInnerMutSubscriber::new());
+    subscriber.trigger_event();
+
+    // Let's just clone the subscriber before adding it to the event manager. This will allow us
+    // to use it from this thread without the need to call into EventManager::subscriber_mut().
+    let subscriber_id = event_manager.add_subscriber(subscriber);
+
+    let thread_handle = thread::spawn(move || {
+        for _ in 0..100 {
+            // When the event manager loop exits, it will return the number of events it
+            // handled.
+            let ev_count = event_manager.run().unwrap();
+            assert_eq!(ev_count, 1);
+        }
+
+        assert!(event_manager.remove_subscriber(subscriber_id).is_ok());
+    });
+    thread_handle.join().unwrap();
+}

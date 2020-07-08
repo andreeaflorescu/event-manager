@@ -5,7 +5,7 @@
 #![deny(missing_docs)]
 
 use std::cell::RefCell;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::rc::Rc;
 use std::result;
 use std::sync::{Arc, Mutex};
@@ -140,43 +140,13 @@ impl<T: EventSubscriber + ?Sized> MutEventSubscriber for T {
     }
 }
 
-impl MutEventSubscriber for Box<dyn MutEventSubscriber> {
-    fn process(&mut self, events: Events, ops: &mut EventOps) {
-        self.deref_mut().process(events, ops);
+impl<T: EventSubscriber + ?Sized> EventSubscriber for Box<T> {
+    fn process(&self, events: Events, ops: &mut EventOps) {
+        self.deref().process(events, ops);
     }
 
-    fn init(&mut self, ops: &mut EventOps) {
-        self.deref_mut().init(ops);
-    }
-}
-
-impl MutEventSubscriber for Box<dyn MutEventSubscriber + Send> {
-    fn process(&mut self, events: Events, ops: &mut EventOps) {
-        self.deref_mut().process(events, ops);
-    }
-
-    fn init(&mut self, ops: &mut EventOps) {
-        self.deref_mut().init(ops);
-    }
-}
-
-impl MutEventSubscriber for Box<dyn MutEventSubscriber + Sync> {
-    fn process(&mut self, events: Events, ops: &mut EventOps) {
-        self.deref_mut().process(events, ops);
-    }
-
-    fn init(&mut self, ops: &mut EventOps) {
-        self.deref_mut().init(ops);
-    }
-}
-
-impl MutEventSubscriber for Box<dyn MutEventSubscriber + Send + Sync> {
-    fn process(&mut self, events: Events, ops: &mut EventOps) {
-        self.deref_mut().process(events, ops);
-    }
-
-    fn init(&mut self, ops: &mut EventOps) {
-        self.deref_mut().init(ops);
+    fn init(&self, ops: &mut EventOps) {
+        self.deref().init(ops);
     }
 }
 
